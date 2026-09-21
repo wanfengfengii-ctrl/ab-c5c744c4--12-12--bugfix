@@ -1,0 +1,67 @@
+# Composite four-direction projection review workbench.
+#
+# Host ports are configurable through the environment (see .env.example):
+#   WEB_PORT  host port mapped to the web UI      (default 8080)
+#   API_PORT  host port mapped to the JSON API    (default 8000)
+#
+# The one-shot `verify` service waits for both containers to report
+# healthy, runs the acceptance suite over real HTTP, and exits 0 on full
+# acceptance or non-zero on any failure:
+#
+#   docker compose up -d --build
+#   docker compose run --rm verify        # exit code reports the result
+
+services:
+  api:
+    build:
+      context: ./backend
+    image: workbench-api:latest
+    environment:
+      # The API image does not bundle the web build; nginx serves the UI.
+      WEB_STATIC_DIR: /nonexistent
+    ports:
+      - "${API_PORT:-8000}:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5).status == 200 else 1)"
+      interval: 5s
+      timeout: 4s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./frontend
+    image: workbench-web:latest
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1/health"]
+      interval: 5s
+      timeout: 4s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+  verify:
+    build:
+      context: ./backend
+    image: workbench-api:latest
+    command: ["python", "acceptance/run_checks.py"]
+    working_dir: /app
+    environment:
+      API_URL: http://api:8000
+      WEB_URL: http://web:80
+    depends_on:
+      api:
+        condition: service_healthy
+      web:
+        condition: service_healthy
+    restart: "no"

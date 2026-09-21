@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
-from typing import List
+from contextlib import asynccontextmanager
+from typing import Any, Dict, List
 
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
@@ -18,10 +20,52 @@ from .models import (
     RejectResponse,
     Witness,
 )
-from .solver import actual_line_sums, solve
+from .solver import SolveResult, actual_line_sums, solve
 from .validation import validate_payload
 
-app = FastAPI(title="复合材料截面四向投影复核台", version="1.0.0")
+# Reconstruction is an exhaustive, purely CPU-bound search: a 12x12
+# instance can keep a core busy for seconds.  Running it directly inside the
+# async endpoint (or in a GIL-bound thread) would freeze the event loop and
+# starve /api/health and every other concurrent request.  A small process
+# pool keeps the event loop responsive while reconstructions run in full
+# parallel on separate interpreters.  One process beyond the core count is
+# kept as headroom so a quick independent request is not stuck behind a
+# full set of multi-second 12x12 searches.
+_SOLVE_WORKERS = max(2, min(4, (os.cpu_count() or 2) + 1))
+_solve_pool: "ProcessPoolExecutor | None" = None
+
+
+def _run_solve(payload: Dict[str, Any]) -> SolveResult:
+    """Top-level worker so it is picklable across the process boundary."""
+    return solve(
+        payload["rows"],
+        payload["cols"],
+        payload["row"],
+        payload["col"],
+        payload["diff"],
+        payload["sum"],
+        payload["known"],
+    )
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _solve_pool
+    from concurrent.futures import ProcessPoolExecutor
+
+    _solve_pool = ProcessPoolExecutor(max_workers=_SOLVE_WORKERS)
+    try:
+        yield
+    finally:
+        _solve_pool.shutdown(wait=True)
+        _solve_pool = None
+
+
+app = FastAPI(
+    title="复合材料截面四向投影复核台",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 
 
 @app.get("/api/health", response_model=Health)
@@ -59,8 +103,23 @@ async def reconstruct(request: Request) -> JSONResponse:
 
     R, C = clean["rows"], clean["cols"]
     known = [(k["row"], k["col"], k["value"]) for k in clean["known"]]
-    result = solve(R, C, clean["row"], clean["col"], clean["diff"], clean["sum"],
-                   known)
+
+    # Offload the CPU-bound exhaustive search; the event loop stays free to
+    # serve /api/health and other concurrent requests while it runs.
+    loop = asyncio.get_running_loop()
+    result: SolveResult = await loop.run_in_executor(
+        _solve_pool,
+        _run_solve,
+        {
+            "rows": R,
+            "cols": C,
+            "row": clean["row"],
+            "col": clean["col"],
+            "diff": clean["diff"],
+            "sum": clean["sum"],
+            "known": known,
+        },
+    )
 
     witnesses: List[Witness] = []
     differences: List[Difference] = []

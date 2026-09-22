@@ -28,6 +28,16 @@ that can only take one value under the current prefix is a logical
 consequence of that prefix, so recording it skips no solution.  The DFS
 therefore emits solutions in ascending row-major lexicographic order, and
 uniqueness is established only after the search space is exhausted.
+
+Propagation is driven by critical lines: for a line with ``need`` ones
+still to place among ``remain`` free cells, a cell on it can be forced
+only when ``need == 0`` (all free cells must be 0) or ``need == remain``
+(all must be 1) — exactly the arc-consistency condition for a cardinality
+constraint.  Every assignment re-checks only its four incident lines and
+queues them when they turn critical, so the search reaches the same
+fixpoint as repeatedly testing every free cell, while doing a constant
+amount of work per assignment.  Free cells are tracked in an integer
+bitmask so the row-major branch cell is the lowest set bit.
 """
 
 from __future__ import annotations
@@ -58,7 +68,7 @@ def solve(
 
     # Cell -> its four line indices (row, col, r-c, r+c).
     cell_lines: List[Tuple[int, int, int, int]] = [(0, 0, 0, 0)] * n
-    line_cells: List[List[int]] = [[] for _ in range(n_lines)]
+    line_lists: List[List[int]] = [[] for _ in range(n_lines)]
     for r in range(R):
         for c in range(C):
             idx = r * C + c
@@ -67,26 +77,37 @@ def solve(
             ls = R + C + nd + (r + c)
             cell_lines[idx] = (lr, lc, ld, ls)
             for li in (lr, lc, ld, ls):
-                line_cells[li].append(idx)
+                line_lists[li].append(idx)
+    line_cells: List[Tuple[int, ...]] = [tuple(cs) for cs in line_lists]
 
     target: List[int] = list(row_sum) + list(col_sum) + list(diff_sum) + list(sum_sum)
     cur = [0] * n_lines                       # number of 1s currently on line
     remain = [len(cs) for cs in line_cells]  # number of free cells on line
     grid = [-1] * n                          # -1 free, else 0/1
-    free_set = set(range(n))
+    free = (1 << n) - 1                      # bitmask of unassigned cells
 
-    def assign(idx: int, v: int) -> None:
+    def assign(idx: int, v: int) -> List[int]:
+        """Fix cell idx to v; return incident lines that turned critical."""
+        nonlocal free
         grid[idx] = v
-        free_set.remove(idx)
+        free &= ~(1 << idx)
+        critical = []
         for li in cell_lines[idx]:
             remain[li] -= 1
             if v == 1:
                 cur[li] += 1
+            rem = remain[li]
+            if rem > 0:
+                need = target[li] - cur[li]
+                if need == 0 or need == rem:
+                    critical.append(li)
+        return critical
 
     def undo(idx: int) -> None:
+        nonlocal free
         v = grid[idx]
         grid[idx] = -1
-        free_set.add(idx)
+        free |= 1 << idx
         for li in cell_lines[idx]:
             remain[li] += 1
             if v == 1:
@@ -108,23 +129,6 @@ def solve(
     found: List[str] = []
     stop = False
 
-    def can_values(idx: int) -> Tuple[bool, bool]:
-        """Whether fixing idx to 0 / 1 is feasible on all four lines."""
-        can0 = True
-        can1 = True
-        for li in cell_lines[idx]:
-            need = target[li] - cur[li]
-            rem = remain[li]  # includes idx, which is still free
-            # idx = 0: need ones among rem-1 other free cells
-            if not (0 <= need <= rem - 1):
-                can0 = False
-            # idx = 1: need-1 ones among rem-1 other free cells
-            if not (1 <= need <= rem):
-                can1 = False
-            if not can0 and not can1:
-                break
-        return can0, can1
-
     def all_lines_feasible() -> bool:
         for li in range(n_lines):
             need = target[li] - cur[li]
@@ -135,41 +139,63 @@ def solve(
     def snapshot() -> str:
         return "".join("1" if grid[i] == 1 else "0" for i in range(n))
 
-    def search() -> None:
+    def propagate(queue: List[int], trail: List[int]) -> bool:
+        """Force every cell settled by a critical line, to a fixpoint.
+
+        ``queue`` holds lines to inspect.  A line with ``need == 0`` forces
+        all its free cells to 0, ``need == remain`` forces them to 1; each
+        forced assignment re-checks its four incident lines and queues the
+        ones that turn critical.  Returns True as soon as a line becomes
+        infeasible (its remaining ones no longer fit its free cells).
+        """
+        nonlocal free
+        while queue:
+            li = queue.pop()
+            rem = remain[li]
+            if rem == 0:
+                continue
+            need = target[li] - cur[li]
+            if need == 0:
+                v = 0
+            elif need == rem:
+                v = 1
+            else:
+                continue  # no longer critical; nothing to force
+            for idx in line_cells[li]:
+                bit = 1 << idx
+                if not free & bit:
+                    continue
+                grid[idx] = v
+                free &= ~bit
+                trail.append(idx)
+                # Update all four incident lines first, then judge: an
+                # infeasible line must still leave the counters consistent
+                # so the caller can roll the trail back cleanly.
+                bad = False
+                for lj in cell_lines[idx]:
+                    remain[lj] -= 1
+                    if v == 1:
+                        cur[lj] += 1
+                    rem2 = remain[lj]
+                    need2 = target[lj] - cur[lj]
+                    if need2 < 0 or need2 > rem2:
+                        bad = True
+                    elif rem2 > 0 and (need2 == 0 or need2 == rem2):
+                        queue.append(lj)
+                if bad:
+                    return True
+        return False
+
+    def search(queue: List[int]) -> None:
         nonlocal stop
         if stop:
             return
 
-        # Propagate forced cells to a fixpoint (arc consistency on the four
-        # line-sum constraints).  Cells forced in one sweep are applied
-        # after the sweep, so the live set is not mutated during iteration.
         trail: List[int] = []
-        contradiction = False
-        while True:
-            forced: List[Tuple[int, int]] = []
-            for idx in free_set:
-                can0, can1 = can_values(idx)
-                if not can0 and not can1:
-                    contradiction = True
-                    break
-                if not can0:
-                    forced.append((idx, 1))
-                elif not can1:
-                    forced.append((idx, 0))
-            if contradiction:
-                break
-            if not forced:
-                break
-            for idx, v in forced:
-                if idx in free_set:
-                    assign(idx, v)
-                    trail.append(idx)
-            if not all_lines_feasible():
-                contradiction = True
-                break
+        contradiction = propagate(queue, trail)
 
         if not contradiction:
-            if not free_set:
+            if free == 0:
                 found.append(snapshot())
                 found.sort()
                 if len(found) > 2:
@@ -177,12 +203,11 @@ def solve(
                 if len(found) == 2:
                     stop = True
             else:
-                # Row-major smallest free cell; branch 0 before 1 so that
-                # solutions are emitted in ascending bit-string order.
-                p = min(free_set)
+                # Row-major smallest free cell (lowest set bit); branch 0
+                # before 1 so solutions are emitted in ascending order.
+                p = (free & -free).bit_length() - 1
                 for v in (0, 1):
-                    assign(p, v)
-                    search()
+                    search(assign(p, v))
                     undo(p)
                     if stop:
                         break
@@ -191,7 +216,7 @@ def solve(
             undo(idx)
 
     if all_lines_feasible():
-        search()
+        search(list(range(n_lines)))
 
     if not found:
         return SolveResult("none", [])
